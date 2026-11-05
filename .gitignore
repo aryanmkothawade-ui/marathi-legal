@@ -1,0 +1,12 @@
+# Data and anything derived from it — court documents contain personal information.
+pdfs/
+corpus/
+corpus_test/
+logs/
+*.jsonl
+anonymization_log*
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+review/

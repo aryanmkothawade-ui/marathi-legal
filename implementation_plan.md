@@ -1,3 +1,5 @@
+> **SUPERSEDED** — SUPERSEDED. The OCR-based extraction plan below was replaced by stage 1b (glyph recovery) after the root cause of the garbled text was found: broken font letter tables, not scanned images. See README.md.
+
 # High-Volume OCR Extraction Plan (`01_extract.py`)
 
 Since we are dealing with **thousands** of legal PDFs, running OCR sequentially on a single CPU core would likely take days or weeks. Furthermore, if the script crashes halfway through, starting over would be a disaster. 

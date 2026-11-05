@@ -1,3 +1,5 @@
+> **SUPERSEDED** — This plan describes the ORIGINAL pipeline (v3). It is superseded: extraction is now stage 1b (glyph recovery, no OCR), cleaning and anonymization were rewritten, and the gazetteer / OCR claims below no longer apply. See README.md and docs/stage1b_results.md.
+
 # MLDC — Marathi Legal Documents Corpus
 ## Implementation Plan v3 (Final — All Limitations Resolved)
 

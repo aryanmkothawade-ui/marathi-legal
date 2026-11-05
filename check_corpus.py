@@ -1,35 +1,27 @@
-import json, os, sys
+"""Quick look at the final corpus:  python check_corpus.py [<base-dir>]
+
+Prints a few documents' metadata and section sizes from <base>/corpus/final/mldc_v1.jsonl and the quality counts.
+"""
+import os
+import sys
+import json
+from collections import Counter
+
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-BASE = r'c:\Users\bigha\OneDrive\Desktop\marathi_legal_document'
-
-print('=== FINAL CORPUS QUALITY CHECK ===')
-for i in range(1, 6):
-    path = os.path.join(BASE, 'corpus', 'segmented', f'{i}.json')
-    with open(path, encoding='utf-8') as f:
-        d = json.load(f)
-    m = d['metadata']
-    s = d['sections']
-    q = d['quality']
-    l = d['labels']
-    print(f'\n--- Doc {i} ---')
-    print(f'  court        : {m.get("court")}')
-    print(f'  year         : {m.get("year")}')
-    print(f'  case_type    : {m.get("case_type")}')
-    print(f'  jurisdiction : {m.get("jurisdiction")}')
-    print(f'  case_number  : {m.get("case_number")}')
-    print(f'  ipc_sections : {m.get("ipc_sections")}')
-    print(f'  doc_type     : {m.get("document_type")}')
-    print(f'  outcome      : {l.get("outcome_normalized")}')
-    print(f'  confidence   : {q.get("segmentation_confidence")}')
-    print(f'  has_result   : {q.get("has_result_section")}')
-    print(f'  sections     : {q.get("body_sections_filled")}/4')
-    print(f'  citations    : {len(d.get("cited_cases", []))}')
-    print(f'  header len   : {len(s.get("header",""))} chars')
-    print(f'  facts len    : {len(s.get("facts",""))} chars')
-    print(f'  pet_args len : {len(s.get("petitioner_arguments",""))} chars')
-    print(f'  res_args len : {len(s.get("respondent_arguments",""))} chars')
-    print(f'  judge_sum len: {len(s.get("judges_summary",""))} chars')
-    result_preview = s.get("case_result","")[:150].strip()
-    print(f'  case_result  : {repr(result_preview)}')
+BASE = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MLDC_BASE", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PATH = os.path.join(BASE, "corpus", "final", "mldc_v1.jsonl")
+rows = [json.loads(l) for l in open(PATH, encoding="utf-8")]
+print(f"{len(rows)} documents in {PATH}\n")
+q = Counter(r["quality"]["segmentation_confidence"] for r in rows)
+print("segmentation confidence:", dict(q))
+print("outcomes:", dict(Counter(r["labels"]["outcome_normalized"] for r in rows)))
+print("case types:", dict(Counter(r["metadata"]["case_type"] for r in rows).most_common(6)))
+print("all fully anonymized:", all(r["quality"]["anonymized"] for r in rows))
+for r in rows[:3]:
+    m, s = r["metadata"], r["content"]["sections"]
+    print(f"\n--- {r['doc_id']}  {m.get('court')} | {m.get('case_type')} | {m.get('year')} | outcome: {r['labels']['outcome_normalized']}")
+    print("    parties:", r["parties"])
+    print("    chars:", {k: len(v) for k, v in s.items()})
+    print("    result:", repr(s["case_result"][:160]))

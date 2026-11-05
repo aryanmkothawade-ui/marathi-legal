@@ -1,0 +1,15 @@
+# core pipeline
+pymupdf>=1.24
+fonttools>=4.50
+numpy>=1.26
+
+# tests
+pytest>=8
+
+# optional: NER booster for the anonymizer (slow on CPU, off by default)
+# transformers
+# torch
+# huggingface_hub
+
+# only needed to rebuild glyph_map.json (tools/glyph_map_build)
+# pillow

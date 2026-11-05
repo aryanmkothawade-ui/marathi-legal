@@ -14,8 +14,10 @@ from datetime import date
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR    = os.environ.get("MLDC_BASE", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 IN_DIR      = os.path.join(BASE_DIR, "corpus", "anonymized")
+GLYPH_LOG   = os.environ.get("MLDC_GLYPH_LOG", os.path.join(BASE_DIR, "corpus", "glyph_fix_log.json"))
+INCLUDE_UNANONYMIZED = "--include-unanonymized" in sys.argv
 OUT_DIR     = os.path.join(BASE_DIR, "corpus", "final")
 JSONL_PATH  = os.path.join(OUT_DIR, "mldc_v1.jsonl")
 INDEX_PATH  = os.path.join(OUT_DIR, "mldc_v1_index.csv")
@@ -23,8 +25,20 @@ LOG_PATH    = os.path.join(BASE_DIR, "logs", "structure_log.json")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-SCHEMA_VERSION   = "1.0"
+SCHEMA_VERSION   = "1.2"
 COLLECTION_DATE  = str(date.today())
+
+
+def load_extraction_info():
+    """doc_id -> how the text was extracted (from the stage-1b log), when available."""
+    try:
+        with open(GLYPH_LOG, encoding="utf-8") as f:
+            return {r["doc_id"]: r for r in json.load(f) if r.get("status") == "ok"}
+    except Exception:
+        return {}
+
+
+EXTRACTION = load_extraction_info()
 
 
 def count_tokens(text: str) -> int:
@@ -43,7 +57,7 @@ def is_code_mixed(text: str) -> bool:
 def build_full_text(sections: dict) -> str:
     """Concatenate all sections into a single clean full-text string."""
     order = [
-        "header", "facts", "petitioner_arguments",
+        "header", "headnote", "facts", "petitioner_arguments",
         "respondent_arguments", "cited_cases_text",
         "judges_summary", "unclassified_body", "case_result"
     ]
@@ -82,7 +96,8 @@ def build_corpus_entry(doc: dict, seq_num: int) -> dict:
             "collection_date":    COLLECTION_DATE,
             "pdf_type":           "native",
             "ocr_engine":         None,
-            "page_count":         None,   # can be enriched from extract log
+            "extraction_method":  EXTRACTION.get(doc.get("doc_id"), {}).get("method"),   # glyphfix | native
+            "page_count":         EXTRACTION.get(doc.get("doc_id"), {}).get("n_pages"),
         },
 
         "metadata": {
@@ -91,6 +106,9 @@ def build_corpus_entry(doc: dict, seq_num: int) -> dict:
             "jurisdiction":       meta.get("jurisdiction"),
             "case_type":          meta.get("case_type"),
             "case_number":        meta.get("case_number"),
+            "case_year":          meta.get("case_year"),
+            "family":             meta.get("family"),
+            "citation":           meta.get("citation"),
             "year":               meta.get("year"),
             "date_of_order":      meta.get("date_of_order"),
             "ipc_sections":       meta.get("ipc_sections", []),
@@ -100,11 +118,12 @@ def build_corpus_entry(doc: dict, seq_num: int) -> dict:
             "code_mix_language":  "English" if code_mixed else None,
         },
 
+        # placeholders only (e.g. "<अर्जदार_1>") — real names never reach this file
         "parties": {
-            "petitioner":           parties.get("petitioner"),
-            "respondent":           parties.get("respondent"),
-            "petitioner_advocate":  parties.get("petitioner_advocate"),
-            "respondent_advocate":  parties.get("respondent_advocate"),
+            "petitioner":  parties.get("petitioner", []),
+            "respondent":  parties.get("respondent", []),
+            "advocates":   parties.get("advocate", []),
+            "judges":      parties.get("judge", []),
         },
 
         "content": {
@@ -112,6 +131,7 @@ def build_corpus_entry(doc: dict, seq_num: int) -> dict:
             "token_count":  token_count,
             "sections": {
                 "header":               sections.get("header", ""),
+                "headnote":             sections.get("headnote", ""),
                 "facts":                sections.get("facts", ""),
                 "petitioner_arguments": sections.get("petitioner_arguments", ""),
                 "respondent_arguments": sections.get("respondent_arguments", ""),
@@ -128,11 +148,13 @@ def build_corpus_entry(doc: dict, seq_num: int) -> dict:
             "bail_granted":       labels.get("bail_granted"),
             "bail_amount_inr":    labels.get("bail_amount_inr"),
             "remanded":           labels.get("remanded", False),
+            "outcome_evidence":   doc.get("outcome_evidence"),
             "stay_granted":       labels.get("stay_granted", False),
         },
 
         "quality": {
-            "anonymized":              quality.get("anonymized", True),
+            "anonymized":              quality.get("anonymized", False),     # False unless the leak scan passed
+            "anonymization":           quality.get("anonymization"),
             "pii_replacements":        quality.get("pii_replacements", 0),
             "duplicate":               False,
             "segmentation_complete":   quality.get("segmentation_complete", False),
@@ -162,6 +184,10 @@ def process_all():
         in_path = os.path.join(IN_DIR, fname)
         with open(in_path, "r", encoding="utf-8") as f:
             doc = json.load(f)
+
+        if not doc.get("quality", {}).get("anonymized", False) and not INCLUDE_UNANONYMIZED:
+            log_entries.append({"doc_id": None, "original_id": doc.get("doc_id"), "status": "excluded_not_anonymized"})
+            continue
 
         entry = build_corpus_entry(doc, i)
         corpus_entries.append(entry)

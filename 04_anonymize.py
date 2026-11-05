@@ -1,406 +1,176 @@
 """
-Stage 4: PII Anonymization — HLDC Paper Methodology (Marathi Adaptation)
-Reads segmented JSON files and anonymizes PII in all text fields.
+Stage 4: PII anonymization  (rewritten — see anonymizer.py for the method)
 
-Replacements:
-  - Person names       → <नाव>
-  - Locations/places   → <ठिकाण>
-  - Advocates names    → <वकील-नाव>
-  - Judge names        → <न्यायाधीश>
-  - Phone numbers      → <फोन>
-  - Aadhaar numbers    → <ओळखपत्र>
-  - PAN cards          → <ओळखपत्र>
-  - Organizations      → <संस्था>
+Reads segmented documents, builds ONE entity registry per document (party header, advocates, judges, titled
+mentions, addresses, optional NER, and a name gazetteer learned from the whole corpus), replaces every mention in
+every section / metadata field, masks structured identifiers, runs a leak scan, and writes:
 
-Saves anonymized JSON to corpus/anonymized/
-Saves anonymization log to logs/anonymization_log.jsonl
+  <out-dir>/<doc_id>.json     anonymized document  (quality.anonymized is True only if the leak scan was clean)
+  <log>                       public-safe log: counts and leak *types*, never real values
+  <private-dir>/...           PRIVATE — real-name map (reversal key) and the learned name gazetteer.
+                              Default: %LOCALAPPDATA%\\mldc_private  (outside the repo and outside OneDrive).
 
-KEY IMPROVEMENTS vs previous version:
-  1. CHECKPOINT: skips already-anonymized documents (safe to re-run)
-  2. LAZY NER LOAD: model loads once; if download fails → regex-only mode (no crash)
-  3. PROGRESS COUNTER: [N/Total] so you know it's running
-  4. BATCH LOG SAVE: log flushed every 100 docs to prevent data loss
+Policy switches (defaults in brackets):  --keep-judges [off: judges are anonymized]   --no-orgs   --no-locations
+                                         --ner [off]   --require-ner   --mask-case-numbers [off]
+Re-running skips documents already produced with the same signature (version + options + gazetteer).
 """
 import os
 import sys
-import re
 import json
-import copy
+import hashlib
+import argparse
+import concurrent.futures as cf
+from collections import Counter
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-IN_DIR   = os.path.join(BASE_DIR, "corpus", "segmented")
-OUT_DIR  = os.path.join(BASE_DIR, "corpus", "anonymized")
-LOG_DIR  = os.path.join(BASE_DIR, "logs")
-ANON_LOG = os.path.join(LOG_DIR, "anonymization_log.jsonl")
+import anonymizer as A
 
-os.makedirs(OUT_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NER MODEL — LAZY LOAD WITH GRACEFUL FALLBACK
-# ═══════════════════════════════════════════════════════════════════════════
-_ner_pipeline = None
-_ner_loaded   = False
-
-def get_ner_pipeline():
-    """Load NER model once; return None if unavailable (triggers regex-only mode)."""
-    global _ner_pipeline, _ner_loaded
-    if _ner_loaded:
-        return _ner_pipeline
-    _ner_loaded = True
-    try:
-        from transformers import pipeline as hf_pipeline
-        import torch
-        device_id = 0 if torch.cuda.is_available() else -1
-        _ner_pipeline = hf_pipeline(
-            "ner",
-            model="kananshah/marathi-legal-ner-finetuned",
-            aggregation_strategy="simple",
-            device=device_id
-        )
-        mode = "GPU (CUDA)" if device_id == 0 else "CPU"
-        print(f"[+] NER model loaded on {mode}.")
-    except Exception as e:
-        print(f"[!] NER model unavailable ({type(e).__name__}: {e})")
-        print("[!] Falling back to REGEX-ONLY anonymization (phones, Aadhaar, PAN, judge/advocate titles).")
-        _ner_pipeline = None
-    return _ner_pipeline
+HERE = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.environ.get("MLDC_BASE", os.path.dirname(HERE))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# REGEX PATTERNS
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Phone: Indian format (10 digits, optional +91 prefix)
-PHONE_RE = re.compile(
-    r'(?:\+91[\s\-]?)?(?:\(?0?\)?[\s\-]?)?[6-9]\d{9}\b'
-)
-
-# Aadhaar: 12 digits (possibly spaced in groups of 4)
-AADHAAR_RE = re.compile(
-    r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b'
-)
-
-# PAN card: 5 uppercase letters + 4 digits + 1 uppercase letter
-PAN_RE = re.compile(
-    r'\b[A-Z]{5}[0-9]{4}[A-Z]\b'
-)
-
-# Judge names: preceded by न्या. / न्यायमूर्ती / माननीय
-JUDGE_TITLE_RE = re.compile(
-    r'(?:न्या\.|न्यायमूर्ती|माननीय\s+न्यायमूर्ती|मा\.)\s+'
-    r'([\u0900-\u097F]{2,}(?:\s+[\u0900-\u097F]{2,}){0,2})',
-    re.IGNORECASE
-)
-
-# Advocate names: preceded by अॅड. / अधिवक्ता / वकील
-ADVOCATE_TITLE_RE = re.compile(
-    r'(?:अॅड\.|अधिवक्ता|वकील|Advocate|Adv\.)\s+'
-    r'([\u0900-\u097FA-Z][^\n,;।]{2,25}?)(?=\s*[,\n।;]|$)',
-    re.IGNORECASE
-)
-
-# Persons with श्री/श्रीमती titles
-TITLE_PERSON_RE = re.compile(
-    r'(?:श्री|श्रीमती|कुमारी|सौ\.?)\s+'
-    r'([\u0900-\u097F]{2,}(?:\s+[\u0900-\u097F]{2,}){0,2})',
-    re.IGNORECASE
-)
-
-# Major court city names to protect from over-anonymization
-PROTECTED_CITIES = {'मुंबई', 'नागपूर', 'औरंगाबाद', 'पुणे', 'Mumbai', 'Nagpur', 'Pune'}
+def default_private_dir():
+    root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(root, "mldc_private")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ANONYMIZATION ENGINE
-# ═══════════════════════════════════════════════════════════════════════════
-
-class Anonymizer:
-    def __init__(self):
-        self.replacements = []  # for logging
-
-    def _log(self, doc_id, original, replaced, method):
-        self.replacements.append({
-            "doc_id": doc_id,
-            "original": original,
-            "replaced": replaced,
-            "method": method
-        })
-
-    def anonymize_text(self, text: str, doc_id: str) -> tuple:
-        """Anonymize all PII in text using Regex + optional NER.
-        Returns (anonymized_text, replacement_count).
-        """
-        if not text or not text.strip():
-            return text, 0
-
-        count = 0
-
-        # ── STEP 1: Structural Regex PII (highest confidence) ──────────────
-
-        def replace_phone(m):
-            nonlocal count
-            self._log(doc_id, m.group(0), '<फोन>', 'regex_phone')
-            count += 1
-            return '<फोन>'
-        text = PHONE_RE.sub(replace_phone, text)
-
-        def replace_aadhaar(m):
-            nonlocal count
-            orig = m.group(0)
-            digits_only = re.sub(r'[\s\-]', '', orig)
-            if len(digits_only) == 12:
-                self._log(doc_id, orig, '<ओळखपत्र>', 'regex_aadhaar')
-                count += 1
-                return '<ओळखपत्र>'
-            return orig
-        text = AADHAAR_RE.sub(replace_aadhaar, text)
-
-        def replace_pan(m):
-            nonlocal count
-            self._log(doc_id, m.group(0), '<ओळखपत्र>', 'regex_pan')
-            count += 1
-            return '<ओळखपत्र>'
-        text = PAN_RE.sub(replace_pan, text)
-
-        # ── STEP 2: NER Model (if available) ───────────────────────────────
-        ner = get_ner_pipeline()
-        if ner:
-            try:
-                # Chunk text to avoid 512 token limit
-                def chunk_text(t, max_len=500):
-                    # 500 chars is around 100-150 words, comfortably under the 512 subword token limit
-                    chunks = []
-                    start = 0
-                    while start < len(t):
-                        max_char_len = min(len(t) - start, max_len)
-                        if start + max_char_len >= len(t):
-                            chunks.append((t[start:], start))
-                            break
-                            
-                        # Try to split at a newline first
-                        split_at = t.rfind('\n', start, start + max_char_len)
-                        if split_at <= start + (max_char_len // 2): # If no newline in the last half
-                            # Fallback to a space
-                            split_at = t.rfind(' ', start, start + max_char_len)
-                            
-                        if split_at <= start:
-                            split_at = start + max_char_len
-                            
-                        chunks.append((t[start:split_at], start))
-                        start = split_at
-                    return chunks
-
-                chunks = chunk_text(text)
-                chunk_strs = [c[0] for c in chunks]
-                chunk_offsets = [c[1] for c in chunks]
-
-                all_entities = []
-                if chunk_strs:
-                    try:
-                        batch_ents = ner(chunk_strs, batch_size=16)
-                        # Normalise pipeline output (single vs multi)
-                        if len(chunk_strs) == 1 and batch_ents and isinstance(batch_ents[0], dict):
-                            batch_ents = [batch_ents]
-                        for i, chunk_ents in enumerate(batch_ents):
-                            offset = chunk_offsets[i]
-                            if not isinstance(chunk_ents, list):
-                                continue
-                            for ent in chunk_ents:
-                                ent['start'] += offset
-                                ent['end'] += offset
-                                all_entities.append(ent)
-                    except Exception as ce:
-                        print(f"  [!] NER batch failed on {doc_id}: {ce}")
-
-                # Sort in reverse order so replacements don't shift indices
-                entities = sorted(all_entities, key=lambda x: x['start'], reverse=True)
-
-                for ent in entities:
-                    label = ent.get('entity_group', ent.get('entity', ''))
-                    start, end = ent['start'], ent['end']
-                    word = ent.get('word', text[start:end])
-
-                    # Protect major court cities
-                    if word in PROTECTED_CITIES and \
-                       ('उच्च न्यायालय' in text or 'खंडपीठ' in text):
-                        continue
-
-                    replacement = None
-                    label_up = label.upper()
-                    if 'PER' in label_up or 'PERSON' in label_up:
-                        replacement = '<नाव>'
-                    elif 'LOC' in label_up or 'LOCATION' in label_up:
-                        replacement = '<ठिकाण>'
-                    elif any(k in label_up for k in ('ORG', 'ORGANIZATION', 'COURT')):
-                        replacement = '<संस्था>'
-
-                    if replacement:
-                        original_str = text[start:end]
-                        self._log(doc_id, original_str, replacement, f'ner_{label}')
-                        count += 1
-                        text = text[:start] + replacement + text[end:]
-
-            except Exception as e:
-                print(f"  [!] NER failed on {doc_id}: {e}")
-
-        # ── STEP 3: Fallback Title Regex (catches what NER missed) ─────────
-
-        def replace_judge(m):
-            nonlocal count
-            full_match = m.group(0)
-            name_part  = m.group(1)
-            if '<' not in name_part:
-                self._log(doc_id, name_part, '<न्यायाधीश>', 'title_judge')
-                count += 1
-                return full_match.replace(name_part, '<न्यायाधीश>')
-            return full_match
-        text = JUDGE_TITLE_RE.sub(replace_judge, text)
-
-        def replace_advocate(m):
-            nonlocal count
-            full_match = m.group(0)
-            name_part  = m.group(1)
-            if len(name_part.strip()) > 2 and '<' not in name_part:
-                self._log(doc_id, name_part, '<वकील-नाव>', 'title_advocate')
-                count += 1
-                return full_match.replace(name_part, '<वकील-नाव>')
-            return full_match
-        text = ADVOCATE_TITLE_RE.sub(replace_advocate, text)
-
-        def replace_titled_person(m):
-            nonlocal count
-            full_match = m.group(0)
-            name_part  = m.group(1)
-            if '<' not in name_part:
-                self._log(doc_id, name_part, '<नाव>', 'title_person')
-                count += 1
-                return full_match.replace(name_part, '<नाव>')
-            return full_match
-        text = TITLE_PERSON_RE.sub(replace_titled_person, text)
-
-        return text, count
-
-    def anonymize_document(self, doc: dict) -> tuple:
-        """Anonymize all text fields in a segmented document dict.
-        Returns (anonymized_doc, total_replacement_count).
-        """
-        result = copy.deepcopy(doc)
-        doc_id = doc.get("doc_id", "unknown")
-        total  = 0
-
-        for section_key in result.get("sections", {}):
-            text = result["sections"][section_key]
-            if isinstance(text, str) and text.strip():
-                anon, n = self.anonymize_text(text, doc_id)
-                result["sections"][section_key] = anon
-                total += n
-
-        parties = result.get("parties", {})
-        for field in ("petitioner", "respondent", "petitioner_advocate", "respondent_advocate"):
-            if field in parties and isinstance(parties[field], str):
-                anon, _ = self.anonymize_text(parties[field], doc_id)
-                result["parties"][field] = anon
-
-        result.setdefault("quality", {})
-        result["quality"]["anonymized"]       = True
-        result["quality"]["pii_replacements"] = total
-
-        return result, total
+_anon = None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════
+def _init(opts, gazetteer):
+    global _anon
+    ner = None
+    if opts["ner"]:
+        import ner_adapter
+        ner = ner_adapter.make_ner(scope_chars=opts["ner_scope"], labels=("Person",))
+    cfg = A.Config(keep_judges=opts["keep_judges"], mask_orgs=not opts["no_orgs"], mask_locations=not opts["no_locations"],
+                   mask_case_numbers=opts["mask_case_numbers"], use_gazetteer=True, ner=ner)
+    _anon = A.Anonymizer(cfg, gazetteer)
 
-def process_all():
-    all_files = sorted(f for f in os.listdir(IN_DIR) if f.endswith(".json"))
-    total     = len(all_files)
 
-    # ── Determine which files still need processing (CHECKPOINT) ───────────
-    todo = []
-    skip = 0
-    for fname in all_files:
-        out_path = os.path.join(OUT_DIR, fname)
-        if os.path.exists(out_path):
-            skip += 1
-        else:
-            todo.append(fname)
+def _work(args):
+    path, signature = args
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    out, rep = _anon.anonymize_document(doc)
+    out["quality"]["anonymization"]["signature"] = signature
+    return os.path.basename(path), out, rep
 
-    print("=" * 65)
-    print("  MLDC -- Stage 4: PII Anonymization (HLDC Paper Method)")
-    print("=" * 65)
-    print(f"  Total segmented docs : {total}")
-    print(f"  Already anonymized   : {skip}  (checkpoint — will SKIP)")
-    print(f"  To process now       : {len(todo)}")
-    print("=" * 65)
 
-    if not todo:
-        print("[OK] All documents already anonymized. Nothing to do.")
-        return
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--in-dir", default=os.path.join(BASE_DIR, "corpus", "segmented"))
+    ap.add_argument("--out-dir", default=os.path.join(BASE_DIR, "corpus", "anonymized"))
+    ap.add_argument("--log", default=os.path.join(BASE_DIR, "logs", "anonymization_log.json"))
+    ap.add_argument("--private-dir", default=default_private_dir())
+    ap.add_argument("--keep-judges", action="store_true")
+    ap.add_argument("--no-orgs", action="store_true")
+    ap.add_argument("--no-locations", action="store_true")
+    ap.add_argument("--mask-case-numbers", action="store_true")
+    ap.add_argument("--ner", action="store_true", help="add the optional NER booster (slow on CPU)")
+    ap.add_argument("--ner-scope", type=int, default=4000, help="characters per document given to NER (0 = all)")
+    ap.add_argument("--require-ner", action="store_true", help="abort if NER cannot be loaded (fail closed)")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--force", action="store_true")
+    a = ap.parse_args()
 
-    # Trigger NER load (with fallback) before the loop
-    get_ner_pipeline()
+    for d in (a.out_dir, a.private_dir, os.path.dirname(a.log)):
+        os.makedirs(d, exist_ok=True)
+    opts = {"keep_judges": a.keep_judges, "no_orgs": a.no_orgs, "no_locations": a.no_locations,
+            "mask_case_numbers": a.mask_case_numbers, "ner": a.ner, "ner_scope": a.ner_scope or None}
 
-    anonymizer       = Anonymizer()
-    total_replacements = 0
-    LOG_BATCH        = 100   # flush log every N docs
-
-    for idx, fname in enumerate(todo, start=1):
-        doc_id   = os.path.splitext(fname)[0]
-        in_path  = os.path.join(IN_DIR, fname)
-        out_path = os.path.join(OUT_DIR, fname)
-
+    if a.ner:                                                    # fail closed: never silently fall back to a weaker mode
         try:
-            with open(in_path, "r", encoding="utf-8") as f:
-                doc = json.load(f)
+            import ner_adapter
+            ner_adapter._pipeline("l3cube-pune/marathi-ner")
         except Exception as e:
-            print(f"[{idx}/{len(todo)}] [ERROR] {fname}: cannot read — {e}")
-            continue
+            if a.require_ner:
+                sys.exit(f"[ABORT] NER requested but unavailable: {type(e).__name__}: {e}")
+            print(f"[WARN] NER unavailable ({type(e).__name__}); continuing WITHOUT it", file=sys.stderr)
+            opts["ner"] = False
 
-        print(f"[{idx}/{len(todo)}] Anonymizing: {fname}", end="  ", flush=True)
+    files = sorted(f for f in os.listdir(a.in_dir) if f.endswith(".json"))
+    print("=" * 65 + "\n  MLDC -- Stage 4: PII Anonymization\n" + "=" * 65)
+    print(f"  segmented documents: {len(files)}   workers: {a.workers}   NER: {'on' if opts['ner'] else 'off'}   judges: {'kept' if a.keep_judges else 'anonymized'}")
+
+    docs = []
+    for f in files:
+        with open(os.path.join(a.in_dir, f), encoding="utf-8") as fh:
+            docs.append(json.load(fh))
+    gz = A.build_gazetteer(docs)
+    gz_path = os.path.join(a.private_dir, "name_gazetteer.json")
+    with open(gz_path, "w", encoding="utf-8") as fh:
+        json.dump(gz, fh, ensure_ascii=False)
+    print(f"  gazetteer: {len(gz['name_ratio'])} name tokens learned from {gz['n_docs']} documents (private)")
+    del docs
+
+    signature = hashlib.sha256((A.VERSION + json.dumps(opts, sort_keys=True) + hashlib.sha256(open(gz_path, 'rb').read()).hexdigest()).encode()).hexdigest()[:16]
+
+    def up_to_date(fname):
+        p = os.path.join(a.out_dir, fname)
+        if a.force or not os.path.exists(p):
+            return False
         try:
-            result, n = anonymizer.anonymize_document(doc)
-        except Exception as e:
-            print(f"\n  [ERROR] anonymization failed: {e}")
-            continue
+            with open(p, encoding="utf-8") as fh:
+                return json.load(fh).get("quality", {}).get("anonymization", {}).get("signature") == signature
+        except Exception:
+            return False
 
+    todo = [f for f in files if not up_to_date(f)]
+    keep = set(files)
+    for f in os.listdir(a.out_dir):                              # drop outputs whose source document no longer exists
+        if f.endswith(".json") and f not in keep:
+            os.remove(os.path.join(a.out_dir, f))
+    print(f"  to process: {len(todo)}   already up to date: {len(files) - len(todo)}   signature: {signature}")
+
+    map_path = os.path.join(a.private_dir, "anonymization_map.json")
+    private = {}
+    if os.path.exists(map_path) and not a.force:
         try:
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"\n  [ERROR] cannot write output: {e}")
-            continue
+            private = json.load(open(map_path, encoding="utf-8"))
+        except Exception:
+            private = {}
+    public = {}
+    if os.path.exists(a.log) and not a.force:
+        try:
+            public = {e["doc_id"]: e for e in json.load(open(a.log, encoding="utf-8"))}
+        except Exception:
+            public = {}
 
-        total_replacements += n
-        print(f"→ {n} replacements")
+    done = 0
+    with cf.ProcessPoolExecutor(max_workers=a.workers, initializer=_init, initargs=(opts, gz)) as ex:
+        for fname, out, rep in ex.map(_work, [(os.path.join(a.in_dir, f), signature) for f in todo], chunksize=8):
+            with open(os.path.join(a.out_dir, fname), "w", encoding="utf-8") as fh:
+                json.dump(out, fh, ensure_ascii=False, indent=1)
+            doc_id = out.get("doc_id", fname[:-5])
+            private[doc_id] = {"entities": rep["entities"], "leaks": rep["leaks"]}
+            public[doc_id] = {
+                "doc_id": doc_id, "entities": rep["n_entities"], "header_parties": rep["header_parties_found"],
+                "replacements": out["quality"]["pii_replacements"], "counts": rep["counts"],
+                "leaks": len(rep["leaks"]), "leak_types": sorted({l[0] for l in rep["leaks"]}),
+                "anonymized": out["quality"]["anonymized"],
+            }
+            done += 1
+            if done % 500 == 0:
+                print(f"  [{done}/{len(todo)}]", flush=True)
 
-        # Flush log every LOG_BATCH docs to prevent data loss
-        if idx % LOG_BATCH == 0:
-            with open(ANON_LOG, "a", encoding="utf-8") as lf:
-                for entry in anonymizer.replacements:
-                    lf.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            anonymizer.replacements.clear()
-            print(f"  [LOG] Flushed anonymization log at {idx} docs.")
+    with open(map_path, "w", encoding="utf-8") as fh:
+        json.dump(private, fh, ensure_ascii=False)
+    with open(a.log, "w", encoding="utf-8") as fh:
+        json.dump(list(public.values()), fh, ensure_ascii=False, indent=1)
 
-    # Final log flush
-    if anonymizer.replacements:
-        with open(ANON_LOG, "a", encoding="utf-8") as lf:
-            for entry in anonymizer.replacements:
-                lf.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    print(f"\n{'=' * 65}")
-    print(f"  Processed this run      : {len(todo)}")
-    print(f"  Total PII replacements  : {total_replacements}")
-    print(f"  Avg per doc             : {total_replacements // max(len(todo), 1)}")
+    rows = list(public.values())
+    kinds = Counter()
+    for r in rows:
+        kinds.update(r["counts"])
     print("=" * 65)
-    print(f"[OK] Anonymized files in : {OUT_DIR}")
-    print(f"[OK] Log appended to     : {ANON_LOG}")
-    print("[!] NOTE: Log contains original PII — keep private.")
+    print(f"  documents: {len(rows)}   fully anonymized: {sum(r['anonymized'] for r in rows)}   with leaks: {sum(not r['anonymized'] for r in rows)}")
+    print(f"  docs with no header party found: {sum(r['header_parties'] == 0 for r in rows)}")
+    print("  replacements:", ", ".join(f"{k} {v}" for k, v in kinds.most_common(12)))
+    print(f"[OK] anonymized -> {a.out_dir}\n[OK] public log -> {a.log}\n[!!] PRIVATE (do not share/commit): {a.private_dir}")
 
 
 if __name__ == "__main__":
-    process_all()
+    main()
